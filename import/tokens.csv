@@ -1,0 +1,19 @@
+chain,address,symbol,cabal_name,involvement,is_primary,outcome
+sol,BFiGUxnidogqcZAPVPDZRCfhx3nXnFLYqpQUaUGpump,SPIKE,Frog,launched,true,open
+sol,HcbsqQC3sn2LMwbjVafiEd8nJ2ATZHH2wXH4xqV2pump,PEACE,JAMIE,launched,true,open
+sol,Faf89929Ni9fbg4gmVZTca7eW6NFg877Jqn6MizT3Gvw,WOLF,JAMIE,launched,true,dead
+base,0xc0634090F2Fe6c6d75e61Be2b949464aBB498973,KTA,JAMIE,launched,true,open
+eth,0x71297312753EA7A2570a5a3278eD70D9a75F4f44,EBULL,JAMIE,launched,true,rug
+eth,0xEE2a03Aa6Dacf51C18679C516ad5283d8E7C2637,NEIRO,JAMIE,launched,true,rug
+eth,0x2633d7EB2df35370641B7Fb0A52Fb7dB615eb01f,TUCKER,JAMIE,launched,true,rug
+sol,7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr,POPCAT,CABANA,launched,true,runner
+sol,A8C3xuqscfmyLrte3VmTqrAq8kgMASius9AFNANwpump,FWOG,CABANA,launched,true,runner
+sol,4XKGjKaKowFvL5sYwh2AKx72vj9iwC8MNvpL44E9pump,BRAINLET,DMT,launched,true,dead
+eth,0x6982508145454Ce325dDbE47a25d4ec3d2311933,PEPE,DMT,launched,true,open
+eth,0x1D0A4821FDEf156b0d051D08A166DE5DF2788Cf7,MOG,DMT,launched,true,dead
+sol,3BeJ9zCgQhaqKMu2HgKJ79yQBChD1Pf3hPwRX44fpump,CHEESEBALL,DMT,launched,true,dead
+sol, kMKX8hBaj3BTRBbeYix9c16EieBP5dih8DTSSwCpum, AFK, CABANA, launched, true, open
+sol,8J69rbLTzWWgUJziFY8jeu5tDwEPBwUz4pKBMr5rpump,WOJAK,Bobo,launched,true,open
+sol,GVENy9WjH1DEr7Fi1czk1nLTmgHXm8wT5j6FC9K6pump,COW,Bobo,launched,true,open
+sol,GeeJEKNBNEZZdHivCBd6m9tAVWbiZ3vvE67BD5X4pump,FINE,Bobo,launched,true,open
+sol,2yfYzpFxvVUHmke4dgxereN24V4BNwEPjnRscs6dpump,PLTR,Bobo,launched,true,open
