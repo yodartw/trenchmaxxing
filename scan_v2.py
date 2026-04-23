@@ -1,35 +1,37 @@
 """
-Enhanced /scan command.
-Fetches early buyers, scores them via scoring.py, filters noise,
-displays only signal wallets (attributed / smart_money / insider).
+Enhanced /scan command — research view for historical winners.
+- Fetches first 30min of buyers
+- Scores each buyer's 14-day general history
+- Ranks by combination of entry earliness (70%) + 14d P&L (30%)
+- NO auto-save to DB — use /promote to curate
 """
 
 import asyncio
 import logging
-import datetime
 from scoring import fetch_wallet_history, classify_wallet
 
 logger = logging.getLogger(__name__)
 
-# Tuning knobs
-SCORE_LIMIT_PER_SCAN = 50      # Max wallets to score per /scan (Helius budget)
-MIN_DISPLAY_SCORE = 50          # Smart money score threshold for display
+SCORE_LIMIT_PER_SCAN = 50
+WINDOW_SECONDS = 1800  # 30 minutes
 
 
-async def score_buyers_bulk(buyers_dict, existing_map, max_to_score=50):
+def compute_research_score(wallet_idx, total_wallets, pnl_rank, total_scored):
     """
-    Score up to max_to_score unknown buyers concurrently.
-    Returns: {wallet_address: {scored_dict, history}}
+    Combined score: 70% entry earliness, 30% P&L rank.
+    wallet_idx: 0 = earliest buyer, total_wallets-1 = latest
+    pnl_rank: 0 = worst P&L, total_scored-1 = best
     """
-    # Only score buyers NOT already in DB (attributed or known-unknown)
-    # Prioritize by entry size (larger SOL in = more likely smart money)
-    unscored = [
-        (addr, info) for addr, info in buyers_dict.items()
-        if addr not in existing_map
-    ]
-    unscored.sort(key=lambda x: x[1].get("sol_in", 0), reverse=True)
-    unscored = unscored[:max_to_score]
+    earliness = 100 * (1 - wallet_idx / max(1, total_wallets - 1))
+    pnl_score = 100 * (pnl_rank / max(1, total_scored - 1)) if total_scored > 1 else 50
+    return round(0.7 * earliness + 0.3 * pnl_score, 1)
 
+
+async def score_buyers_bulk(buyers_ordered, max_to_score=50):
+    """
+    Score up to max_to_score buyers concurrently. Returns dict: addr -> {scored, history}
+    """
+    to_score = buyers_ordered[:max_to_score]
     scored_map = {}
 
     async def _score_one(addr):
@@ -41,18 +43,16 @@ async def score_buyers_bulk(buyers_dict, existing_map, max_to_score=50):
             logger.warning(f"Score failed for {addr[:10]}: {e}")
             return addr, None
 
-    tasks = [_score_one(addr) for addr, _ in unscored]
+    tasks = [_score_one(addr) for addr in to_score]
     results = await asyncio.gather(*tasks, return_exceptions=False)
-
     for addr, data in results:
         if data:
             scored_map[addr] = data
-
     return scored_map
 
 
 async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_bundles):
-    """Enhanced /scan with scoring integration."""
+    """Research-mode /scan: show ranked buyers, no DB writes."""
     if not context.args:
         await update.message.reply_text("Usage: /scan <mint_address>")
         return
@@ -62,15 +62,18 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
         await update.message.reply_text("That doesn't look like a Solana mint address.")
         return
 
-    await update.message.reply_text(f"Scanning {mint[:10]}... pulling buyers + scoring...")
+    await update.message.reply_text(
+        f"Scanning {mint[:10]}... first 30min of buyers, scoring up to {SCORE_LIMIT_PER_SCAN}..."
+    )
 
-    buyers = await fetch_early_buyers(mint, window_seconds=300)
+    buyers = await fetch_early_buyers(mint, window_seconds=WINDOW_SECONDS)
     if not buyers:
         await update.message.reply_text("No early buyers found or API error.")
         return
 
     bundles = detect_bundles(buyers)
 
+    # Dedupe: earliest buy per wallet
     unique_buyers = {}
     for b in buyers:
         w = b["buyer"]
@@ -83,154 +86,164 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
         for w in wallets:
             wallet_to_bundle[w] = group_id
 
-    # Cross-reference against DB
+    # Cross-reference DB for attribution + existing scores
     addresses = list(unique_buyers.keys())
     existing = (
         supabase.table("wallets")
-        .select("address, quality_tier, classification, smart_money_score, cabals(name), cabal_members(x_handle)")
+        .select("address, classification, smart_money_score, insider_score, cabals(name), cabal_members(x_handle)")
         .in_("address", addresses)
         .execute()
     ).data or []
     existing_map = {w["address"]: w for w in existing}
 
-    # Resolve token symbol
+    # Token symbol
     sym_result = supabase.table("tokens").select("symbol").eq("address", mint).eq("chain", "sol").execute()
     token_symbol = sym_result.data[0]["symbol"] if sym_result.data else mint[:6]
 
-    # Score new buyers (up to limit)
+    # Order buyers by entry time (earliest first)
+    ordered_buyers = sorted(unique_buyers.items(), key=lambda x: x[1]["block_time"])
+    ordered_addrs = [addr for addr, _ in ordered_buyers]
+
+    # Score only wallets NOT already in DB with recent score
+    to_score = []
+    for addr in ordered_addrs:
+        if addr in existing_map and existing_map[addr].get("smart_money_score") is not None:
+            continue
+        to_score.append(addr)
+
     await update.message.reply_text(
-        f"Found {len(unique_buyers)} buyers. Scoring up to {SCORE_LIMIT_PER_SCAN} new wallets..."
+        f"Found {len(unique_buyers)} buyers. Scoring {min(len(to_score), SCORE_LIMIT_PER_SCAN)} new wallets (14d history)..."
     )
-    scored_new = await score_buyers_bulk(unique_buyers, existing_map, SCORE_LIMIT_PER_SCAN)
+    scored_new = await score_buyers_bulk(to_score, SCORE_LIMIT_PER_SCAN)
 
-    # Categorize all buyers
-    attributed = []
-    smart_money = []
-    insiders = []
-    filtered_out = 0
-    saved_count = 0
-
-    for addr, buyer_info in unique_buyers.items():
-        bundle_group = wallet_to_bundle.get(addr)
-
-        if addr in existing_map:
-            w = existing_map[addr]
-            if w.get("cabals"):
-                attributed.append((addr, buyer_info, w))
-            elif w.get("classification") == "smart_money":
-                smart_money.append((addr, buyer_info, w, None))
-            elif w.get("classification") == "insider" or bundle_group:
-                insiders.append((addr, buyer_info, w, None))
-            # else: already in DB but not promising, skip
-            continue
-
-        # New wallet — check score
+    # Build unified list with P&L and classification for each wallet
+    entries = []  # list of dicts, one per wallet
+    for idx, (addr, buyer_info) in enumerate(ordered_buyers):
+        existing_rec = existing_map.get(addr)
         score_data = scored_new.get(addr)
-        if not score_data:
-            filtered_out += 1
-            continue
 
-        scored = score_data["scored"]
-        history = score_data["history"]
-        classification = scored["classification"]
-
-        if classification == "smart_money":
-            smart_money.append((addr, buyer_info, None, score_data))
-        elif classification == "insider" or (bundle_group and scored["insider_score"] >= 30):
-            insiders.append((addr, buyer_info, None, score_data))
+        if score_data:
+            history = score_data["history"]
+            scored = score_data["scored"]
+            pnl = history["net_sol_pnl"]
+            trades = history["trade_count"]
+            unique_coins = history["unique_coins"]
+            winners = history["winners"]
+            classification = scored["classification"]
+            sm_score = scored["smart_money_score"]
+        elif existing_rec:
+            pnl = None
+            trades = None
+            unique_coins = None
+            winners = None
+            classification = existing_rec.get("classification") or "unscored"
+            sm_score = existing_rec.get("smart_money_score") or 0
         else:
-            # Noise / dormant — don't save, don't display
-            filtered_out += 1
-            continue
+            # Neither scored nor in DB (exceeded scan limit)
+            pnl = None
+            trades = None
+            unique_coins = None
+            winners = None
+            classification = "unscored"
+            sm_score = 0
 
-        # Save the ones we kept
-        try:
-            label = f"scan:{token_symbol} {buyer_info['sol_in']:.1f}SOL sm:{scored['smart_money_score']}"
-            if bundle_group:
-                label = f"{bundle_group} {label}"
+        entries.append({
+            "addr": addr,
+            "buyer_info": buyer_info,
+            "entry_idx": idx,
+            "pnl": pnl,
+            "trades": trades,
+            "unique_coins": unique_coins,
+            "winners": winners,
+            "classification": classification,
+            "sm_score": sm_score,
+            "existing": existing_rec,
+            "bundle_id": wallet_to_bundle.get(addr),
+        })
 
-            supabase.table("wallets").insert({
-                "chain": "sol",
-                "address": addr,
-                "wallet_type": "unknown",
-                "confidence": "suspected",
-                "label": label,
-                "discovered_via": f"scan:{token_symbol}",
-                "quality_tier": "raw",
-                "bundle_group_id": bundle_group,
-                "smart_money_score": scored["smart_money_score"],
-                "insider_score": scored["insider_score"],
-                "classification": classification,
-                "last_scored_at": datetime.datetime.utcnow().isoformat(),
-                "trade_count_30d": history["trade_count"],
-                "winners_2x": history["winners"],
-            }).execute()
-            saved_count += 1
-        except Exception as e:
-            if "duplicate" not in str(e).lower():
-                logger.warning(f"Scan insert failed {addr[:10]}: {e}")
+    # Rank entries that have P&L data
+    entries_with_pnl = [e for e in entries if e["pnl"] is not None]
+    # Sort by P&L asc to assign pnl_rank (index = rank, higher index = better P&L)
+    entries_with_pnl_sorted = sorted(entries_with_pnl, key=lambda e: e["pnl"])
+    pnl_rank_map = {e["addr"]: idx for idx, e in enumerate(entries_with_pnl_sorted)}
 
-    # Unscored = buyers beyond SCORE_LIMIT_PER_SCAN; count them but don't display
-    unscored_count = max(0, len(unique_buyers) - len(existing_map) - len(scored_new))
+    # Compute research score for every entry
+    total_buyers = len(entries)
+    total_with_pnl = len(entries_with_pnl)
+    for e in entries:
+        if e["pnl"] is None:
+            # Unscored: give 0 on P&L dimension, keep earliness
+            earliness = 100 * (1 - e["entry_idx"] / max(1, total_buyers - 1))
+            e["research_score"] = round(0.7 * earliness + 0.3 * 0, 1)
+        else:
+            pnl_rank = pnl_rank_map[e["addr"]]
+            e["research_score"] = compute_research_score(
+                e["entry_idx"], total_buyers, pnl_rank, total_with_pnl
+            )
+
+    # Sort by research score desc
+    entries.sort(key=lambda e: e["research_score"], reverse=True)
 
     # Build output
     lines = [
         f"🔍 <b>/scan ${token_symbol}</b>",
         f"<code>{mint}</code>",
-        f"{len(unique_buyers)} buyers · {len(bundles)} bundles · scored {len(scored_new)}",
+        f"{len(unique_buyers)} buyers · 30min window · {len(bundles)} bundle groups",
+        f"Scored {len(scored_new)} new · {len(existing_map)} already in DB",
         "",
     ]
 
-    if attributed:
-        lines.append(f"<b>⚡ Attributed ({len(attributed)}):</b>")
-        for addr, info, w in sorted(attributed, key=lambda x: x[1]["block_time"])[:10]:
-            cabal = w["cabals"]["name"] if w.get("cabals") else "?"
-            handle = w["cabal_members"]["x_handle"] if w.get("cabal_members") else ""
-            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
-            lines.append(f"  {cabal} {handle}{bundle_str} · {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>")
+    # Show top 20 entries
+    lines.append(f"<b>Ranked by research score (entry 70% + 14d P&L 30%)</b>")
+    lines.append("")
+
+    display_count = min(20, len(entries))
+    for i, e in enumerate(entries[:display_count]):
+        addr_short = e["addr"][:8]
+        entry_min = (e["buyer_info"]["block_time"] - ordered_buyers[0][1]["block_time"]) / 60
+
+        # Tags
+        tags = []
+        if e["existing"] and e["existing"].get("cabals"):
+            cabal = e["existing"]["cabals"]["name"]
+            handle = e["existing"].get("cabal_members", {})
+            handle_str = handle.get("x_handle", "") if handle else ""
+            tags.append(f"⚡ {cabal}{' ' + handle_str if handle_str else ''}")
+        elif e["classification"] == "smart_money":
+            tags.append(f"🎯 sm:{e['sm_score']}")
+        elif e["classification"] == "insider":
+            tags.append(f"🔒 insider")
+        elif e["classification"] == "noise":
+            tags.append(f"🤖 noise")
+        elif e["classification"] == "dormant":
+            tags.append(f"💤 dormant")
+        elif e["classification"] == "unscored":
+            tags.append(f"❓ unscored")
+
+        if e["bundle_id"]:
+            tags.append("🔗")
+
+        tag_str = " · ".join(tags)
+
+        # Core line
+        sol_in = e["buyer_info"]["sol_in"]
+        lines.append(
+            f"<b>#{i+1} · {e['research_score']}</b> · <code>{addr_short}...</code> · {tag_str}"
+        )
+        lines.append(f"    Entry: {sol_in:.2f} SOL @ {entry_min:.1f}min")
+
+        # Stats line (only if scored)
+        if e["pnl"] is not None:
+            hit_rate = (e["winners"] / e["unique_coins"] * 100) if e["unique_coins"] else 0
+            lines.append(
+                f"    14d: {e['pnl']:+.1f} SOL · {e['trades']}t · {e['unique_coins']}c · {hit_rate:.0f}% hit"
+            )
         lines.append("")
 
-    if smart_money:
-        lines.append(f"<b>🎯 Smart Money ({len(smart_money)}):</b>")
-        # Sort by smart_money_score desc
-        def sm_score(entry):
-            _, _, db_w, score_data = entry
-            if score_data:
-                return score_data["scored"]["smart_money_score"]
-            return db_w.get("smart_money_score") or 0
-        for addr, info, db_w, score_data in sorted(smart_money, key=sm_score, reverse=True)[:10]:
-            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
-            if score_data:
-                s = score_data["scored"]["smart_money_score"]
-                pnl = score_data["history"]["net_sol_pnl"]
-                trades = score_data["history"]["trade_count"]
-                stats = f"sm:{s} · {trades}t · {pnl:+.1f}SOL 14d"
-            else:
-                s = db_w.get("smart_money_score") or 0
-                stats = f"sm:{s}"
-            lines.append(f"  {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>{bundle_str} · {stats}")
+    if len(entries) > display_count:
+        lines.append(f"<i>...+{len(entries) - display_count} more buyers not shown</i>")
         lines.append("")
 
-    if insiders:
-        lines.append(f"<b>🔒 Insider / Bundle ({len(insiders)}):</b>")
-        for addr, info, db_w, score_data in sorted(insiders, key=lambda x: x[1]["block_time"])[:8]:
-            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
-            if score_data:
-                ins = score_data["scored"]["insider_score"]
-                stats = f"ins:{ins}"
-            else:
-                ins = db_w.get("insider_score") if db_w else 0
-                stats = f"ins:{ins or '?'}"
-            lines.append(f"  {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>{bundle_str} · {stats}")
-        lines.append("")
-
-    # Summary footer
-    lines.append(f"<b>📊 Summary:</b>")
-    lines.append(f"  Saved to DB: {saved_count}")
-    lines.append(f"  Filtered (noise/dormant): {filtered_out}")
-    if unscored_count > 0:
-        lines.append(f"  Unscored (over limit): {unscored_count}")
-    if bundles:
-        lines.append(f"  Bundle groups: {len(bundles)}")
+    lines.append(f"<b>To save a wallet:</b> /promote <code>&lt;address&gt;</code>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)

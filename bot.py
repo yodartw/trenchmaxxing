@@ -1348,6 +1348,88 @@ async def scan_command(update, context):
     await scan_command_v2(update, context, supabase, fetch_early_buyers, detect_bundles)
 
 
+async def promote_command(update, context):
+    """Usage: /promote <wallet_address> [optional note]"""
+    if not context.args:
+        await update.message.reply_text("Usage: /promote <wallet_address> [note]")
+        return
+
+    wallet = context.args[0].strip()
+    note = " ".join(context.args[1:]) if len(context.args) > 1 else None
+
+    if len(wallet) < 30 or len(wallet) > 50:
+        await update.message.reply_text("That doesn't look like a Solana wallet address.")
+        return
+
+    # Check if already in DB
+    existing = supabase.table("wallets").select("id, classification, label").eq("address", wallet).execute()
+    if existing.data:
+        existing_rec = existing.data[0]
+        if note:
+            new_label = f"{existing_rec.get('label') or ''} | promoted: {note}".strip(" |")
+            supabase.table("wallets").update({"label": new_label}).eq("address", wallet).execute()
+            await update.message.reply_text(
+                f"✅ Wallet already in DB. Updated label.\n"
+                f"<code>{wallet}</code>\n"
+                f"Classification: {existing_rec.get('classification') or '?'}",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(
+                f"ℹ️ Already in DB.\n"
+                f"<code>{wallet}</code>\n"
+                f"Classification: {existing_rec.get('classification') or '?'}",
+                parse_mode="HTML"
+            )
+        return
+
+    # Score the wallet fresh
+    await update.message.reply_text(f"Scoring {wallet[:10]}... (14d)")
+    from scoring import fetch_wallet_history, classify_wallet
+    history = await fetch_wallet_history(wallet, days=14)
+    scored = classify_wallet(history)
+
+    # Insert
+    import datetime
+    label = f"promoted"
+    if note:
+        label = f"promoted: {note}"
+
+    try:
+        supabase.table("wallets").insert({
+            "chain": "sol",
+            "address": wallet,
+            "wallet_type": "unknown",
+            "confidence": "suspected",
+            "label": label,
+            "discovered_via": "manual_promote",
+            "quality_tier": "raw",
+            "smart_money_score": scored["smart_money_score"],
+            "insider_score": scored["insider_score"],
+            "classification": scored["classification"],
+            "last_scored_at": datetime.datetime.utcnow().isoformat(),
+            "trade_count_30d": history["trade_count"],
+            "winners_2x": history["winners"],
+        }).execute()
+
+        emoji = {
+            "smart_money": "🎯",
+            "insider": "🔒",
+            "noise": "🤖",
+            "dormant": "💤",
+        }.get(scored["classification"], "❓")
+
+        await update.message.reply_text(
+            f"✅ <b>Promoted</b>\n"
+            f"<code>{wallet}</code>\n"
+            f"{emoji} {scored['classification'].upper()}\n"
+            f"Smart money: {scored['smart_money_score']}/100 · Insider: {scored['insider_score']}/100\n"
+            f"14d: {history['trade_count']} trades, {history['unique_coins']} coins, "
+            f"{history['net_sol_pnl']:+.1f} SOL P&L",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
 
 # ---------- /score — wallet classification ----------
@@ -1431,6 +1513,7 @@ def main():
     app.add_handler(CommandHandler("confluence", confluence_command))
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("score", score_command))
+    app.add_handler(CommandHandler("promote", promote_command))
     logger.info("Bot starting polling...")
     app.run_polling()
 
