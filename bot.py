@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from scoring import fetch_wallet_history, classify_wallet
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -1343,385 +1344,16 @@ def detect_bundles(buyers):
 
 
 async def scan_command(update, context):
-    if not context.args:
-        await update.message.reply_text("Usage: /scan <mint_address>")
-        return
-
-    mint = context.args[0].strip()
-    if len(mint) < 30 or len(mint) > 50:
-        await update.message.reply_text("That doesn't look like a Solana mint address.")
-        return
-
-    await update.message.reply_text(f"Scanning {mint[:10]}... first 5min of buyers...")
-
-    buyers = await fetch_early_buyers(mint, window_seconds=300)
-    if not buyers:
-        await update.message.reply_text("No early buyers found or API error.")
-        return
-
-    bundles = detect_bundles(buyers)
-
-    unique_buyers = {}
-    for b in buyers:
-        w = b["buyer"]
-        if w not in unique_buyers or b["block_time"] < unique_buyers[w]["block_time"]:
-            unique_buyers[w] = b
-
-    wallet_to_bundle = {}
-    for tx_sig, wallets in bundles.items():
-        group_id = f"bundle:{mint[:8]}:{tx_sig[:8]}"
-        for w in wallets:
-            wallet_to_bundle[w] = group_id
-
-    addresses = list(unique_buyers.keys())
-    existing = (
-        supabase.table("wallets")
-        .select("address, quality_tier, cabals(name), cabal_members(x_handle)")
-        .in_("address", addresses)
-        .execute()
-    ).data or []
-    existing_map = {w["address"]: w for w in existing}
-
-    sym_result = supabase.table("tokens").select("symbol").eq("address", mint).eq("chain", "sol").execute()
-    token_symbol = sym_result.data[0]["symbol"] if sym_result.data else mint[:6]
-
-    added_count = 0
-    for addr, buyer_info in unique_buyers.items():
-        if addr in existing_map:
-            continue
-        bundle_group = wallet_to_bundle.get(addr)
-        label = f"scan:{token_symbol} first-{buyer_info['sol_in']:.1f}SOL"
-        if bundle_group:
-            label = f"{bundle_group} {label}"
-        try:
-            supabase.table("wallets").insert({
-                "chain": "sol",
-                "address": addr,
-                "wallet_type": "unknown",
-                "confidence": "suspected",
-                "label": label,
-                "discovered_via": f"scan:{token_symbol}",
-                "quality_tier": "raw",
-                "bundle_group_id": bundle_group,
-            }).execute()
-            added_count += 1
-        except Exception as e:
-            if "duplicate" not in str(e).lower():
-                logger.warning(f"Scan insert failed {addr}: {e}")
-
-    lines = [
-        f"🔍 <b>/scan ${token_symbol}</b>",
-        f"<code>{mint}</code>",
-        f"{len(unique_buyers)} unique buyers · {len(bundles)} bundle groups",
-        "",
-    ]
-
-    attributed = [(a, info) for a, info in unique_buyers.items()
-                  if a in existing_map and existing_map[a].get("cabals")]
-    unknown_hits = [(a, info) for a, info in unique_buyers.items()
-                    if a in existing_map and not existing_map[a].get("cabals")]
-    new_raw = [(a, info) for a, info in unique_buyers.items() if a not in existing_map]
-
-    if attributed:
-        lines.append(f"<b>⚡ Attributed ({len(attributed)}):</b>")
-        for addr, info in sorted(attributed, key=lambda x: x[1]["block_time"])[:15]:
-            w = existing_map[addr]
-            cabal = w["cabals"]["name"] if w.get("cabals") else "?"
-            handle = w["cabal_members"]["x_handle"] if w.get("cabal_members") else ""
-            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
-            lines.append(f"  {cabal} {handle}{bundle_str} · {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>")
-        lines.append("")
-
-    if unknown_hits:
-        lines.append(f"<b>📊 Known-unknown ({len(unknown_hits)}):</b>")
-        for addr, info in sorted(unknown_hits, key=lambda x: x[1]["block_time"])[:10]:
-            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
-            lines.append(f"  {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>{bundle_str}")
-        lines.append("")
-
-    if new_raw:
-        lines.append(f"<b>🆕 New as raw ({added_count}):</b>")
-        for addr, info in sorted(new_raw, key=lambda x: x[1]["block_time"])[:15]:
-            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
-            lines.append(f"  {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>{bundle_str}")
-        if len(new_raw) > 15:
-            lines.append(f"  <i>...+{len(new_raw) - 15} more (all added)</i>")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    from scan_v2 import scan_command_v2
+    await scan_command_v2(update, context, supabase, fetch_early_buyers, detect_bundles)
 
 
 
 
-# ---------- Wallet Scoring System ----------
-
-async def fetch_wallet_history(wallet_address, days=14):
-    """
-    Pull swap activity for a wallet over last N days.
-    Returns aggregate stats for classification.
-    """
-    import time
-    cutoff = int(time.time()) - (days * 86400)
-
-    url = f"{HELIUS_BASE}/addresses/{wallet_address}/transactions"
-    params_base = {"api-key": HELIUS_API_KEY, "limit": 100, "type": "SWAP"}
-
-    all_txs = []
-    before = None
-    for page in range(10):  # max 1000 swaps
-        params = dict(params_base)
-        if before:
-            params["before"] = before
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                chunk = r.json()
-        except Exception as e:
-            logger.warning(f"History fetch failed for {wallet_address[:10]}: {e}")
-            break
-        if not chunk:
-            break
-        # Stop if we've passed the cutoff window
-        oldest_in_chunk = chunk[-1].get("timestamp", 0)
-        all_txs.extend(chunk)
-        before = chunk[-1].get("signature")
-        if oldest_in_chunk < cutoff:
-            break
-        if len(chunk) < 100:
-            break
-
-    if not all_txs:
-        return {
-            "trade_count": 0,
-            "unique_coins": 0,
-            "net_sol_pnl": 0.0,
-            "winners": 0,
-            "losers": 0,
-            "avg_hold_minutes": 0,
-            "first_trade_days_ago": 0,
-            "in_window_count": 0,
-        }
-
-    # Track per-coin buy/sell SOL deltas
-    coins = {}  # mint -> {"buys_sol": 0, "sells_sol": 0, "first_buy_ts": ...}
-    in_window_count = 0
-    earliest_ts = None
-
-    for tx in all_txs:
-        ts = tx.get("timestamp", 0)
-        if ts < cutoff:
-            continue
-        in_window_count += 1
-        if earliest_ts is None or ts < earliest_ts:
-            earliest_ts = ts
-
-        token_transfers = tx.get("tokenTransfers") or []
-        account_data = tx.get("accountData") or []
-
-        # Find wallet's SOL delta in this tx
-        sol_delta = 0
-        for ad in account_data:
-            if ad.get("account") == wallet_ad
-cat > /tmp/scoring_block.py << 'PYEOF'
-
-
-# ---------- Wallet Scoring System ----------
-
-async def fetch_wallet_history(wallet_address, days=14):
-    """
-    Pull swap activity for a wallet over last N days.
-    Returns aggregate stats for classification.
-    """
-    import time
-    cutoff = int(time.time()) - (days * 86400)
-
-    url = f"{HELIUS_BASE}/addresses/{wallet_address}/transactions"
-    params_base = {"api-key": HELIUS_API_KEY, "limit": 100, "type": "SWAP"}
-
-    all_txs = []
-    before = None
-    for page in range(10):  # max 1000 swaps
-        params = dict(params_base)
-        if before:
-            params["before"] = before
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                chunk = r.json()
-        except Exception as e:
-            logger.warning(f"History fetch failed for {wallet_address[:10]}: {e}")
-            break
-        if not chunk:
-            break
-        # Stop if we've passed the cutoff window
-        oldest_in_chunk = chunk[-1].get("timestamp", 0)
-        all_txs.extend(chunk)
-        before = chunk[-1].get("signature")
-        if oldest_in_chunk < cutoff:
-            break
-        if len(chunk) < 100:
-            break
-
-    if not all_txs:
-        return {
-            "trade_count": 0,
-            "unique_coins": 0,
-            "net_sol_pnl": 0.0,
-            "winners": 0,
-            "losers": 0,
-            "avg_hold_minutes": 0,
-            "first_trade_days_ago": 0,
-            "in_window_count": 0,
-        }
-
-    # Track per-coin buy/sell SOL deltas
-    coins = {}  # mint -> {"buys_sol": 0, "sells_sol": 0, "first_buy_ts": ...}
-    in_window_count = 0
-    earliest_ts = None
-
-    for tx in all_txs:
-        ts = tx.get("timestamp", 0)
-        if ts < cutoff:
-            continue
-        in_window_count += 1
-        if earliest_ts is None or ts < earliest_ts:
-            earliest_ts = ts
-
-        token_transfers = tx.get("tokenTransfers") or []
-        account_data = tx.get("accountData") or []
-
-        # Find wallet's SOL delta in this tx
-        sol_delta = 0
-        for ad in account_data:
-            if ad.get("account") == wallet_address:
-                sol_delta = int(ad.get("nativeBalanceChange", 0)) / 1e9
-                break
-
-        # Identify which mint moved (not wSOL, not USDC)
-        for tt in token_transfers:
-            mint = tt.get("mint")
-            if mint in SKIP_MINTS:
-                continue
-            to_user = tt.get("toUserAccount")
-            from_user = tt.get("fromUserAccount")
-
-            if mint not in coins:
-                coins[mint] = {"buys_sol": 0, "sells_sol": 0, "first_buy_ts": ts}
-
-            # Buy: wallet received tokens, SOL outflow
-            if to_user == wallet_address and sol_delta < 0:
-                coins[mint]["buys_sol"] += abs(sol_delta)
-                if ts < coins[mint]["first_buy_ts"]:
-                    coins[mint]["first_buy_ts"] = ts
-            # Sell: wallet sent tokens, SOL inflow
-            elif from_user == wallet_address and sol_delta > 0:
-                coins[mint]["sells_sol"] += sol_delta
-
-    # Compute per-coin P&L
-    winners = 0  # coins where sells > 2x buys
-    losers = 0   # coins where sells < 0.5x buys
-    total_buy_sol = 0
-    total_sell_sol = 0
-    for mint, stats in coins.items():
-        buys = stats["buys_sol"]
-        sells = stats["sells_sol"]
-        if buys <= 0:
-            continue
-        total_buy_sol += buys
-        total_sell_sol += sells
-        ratio = sells / buys if buys > 0 else 0
-        if ratio >= 2.0:
-            winners += 1
-        elif ratio < 0.5:
-            losers += 1
-
-    first_trade_days_ago = 0
-    if earliest_ts:
-        import time as _t
-        first_trade_days_ago = int((_t.time() - earliest_ts) / 86400)
-
-    return {
-        "trade_count": in_window_count,
-        "unique_coins": len(coins),
-        "net_sol_pnl": round(total_sell_sol - total_buy_sol, 3),
-        "winners": winners,
-        "losers": losers,
-        "avg_hold_minutes": 0,  # placeholder, implement later
-        "first_trade_days_ago": first_trade_days_ago,
-        "in_window_count": in_window_count,
-    }
-
-
-def classify_wallet(history):
-    """
-    Score a wallet based on its 14d history.
-    Returns dict with scores and classification.
-    """
-    trade_count = history["trade_count"]
-    unique_coins = history["unique_coins"]
-    winners = history["winners"]
-    losers = history["losers"]
-    net_pnl = history["net_sol_pnl"]
-
-    smart_money_score = 0
-    insider_score = 0
-    noise_score = 0
-
-    # Activity bucket (core filter)
-    if 5 <= trade_count <= 30:
-        smart_money_score += 40
-    elif trade_count > 100:
-        noise_score += 60
-    elif trade_count < 2:
-        noise_score += 40
-
-    # Win rate
-    if unique_coins >= 3:
-        win_rate = winners / unique_coins if unique_coins > 0 else 0
-        if win_rate >= 0.3:
-            smart_money_score += 30
-        if win_rate >= 0.5:
-            smart_money_score += 10
-
-    # P&L
-    if net_pnl > 2.0:
-        smart_money_score += 15
-    elif net_pnl < -5.0:
-        smart_money_score -= 10
-
-    # Insider signal: few coins but all profitable (small surgical wallet)
-    if unique_coins > 0 and unique_coins <= 4 and winners >= 2 and trade_count < 10:
-        insider_score += 50
-
-    # Dormant
-    if trade_count == 0:
-        classification = "dormant"
-    # Noise
-    elif noise_score > 50 or trade_count > 100:
-        classification = "noise"
-    # Insider
-    elif insider_score >= 50:
-        classification = "insider"
-    # Smart money
-    elif smart_money_score >= 60 and noise_score < 30:
-        classification = "smart_money"
-    else:
-        classification = "dormant"
-
-    return {
-        "smart_money_score": max(0, min(100, smart_money_score)),
-        "insider_score": max(0, min(100, insider_score)),
-        "noise_score": max(0, min(100, noise_score)),
-        "classification": classification,
-    }
-
+# ---------- /score — wallet classification ----------
 
 async def score_command(update, context):
-    """
-    Usage: /score <wallet_address>
-    Debug command to classify a single wallet.
-    """
+    """Usage: /score <wallet_address>"""
     if not context.args:
         await update.message.reply_text("Usage: /score <wallet_address>")
         return
@@ -1736,23 +1368,21 @@ async def score_command(update, context):
     history = await fetch_wallet_history(wallet, days=14)
     scored = classify_wallet(history)
 
-    # Persist to DB if wallet exists
     try:
         existing = supabase.table("wallets").select("id").eq("address", wallet).execute()
         if existing.data:
-            import datetime as _dt
+            import datetime
             supabase.table("wallets").update({
                 "smart_money_score": scored["smart_money_score"],
                 "insider_score": scored["insider_score"],
                 "classification": scored["classification"],
-                "last_scored_at": _dt.datetime.utcnow().isoformat(),
+                "last_scored_at": datetime.datetime.utcnow().isoformat(),
                 "trade_count_30d": history["trade_count"],
                 "winners_2x": history["winners"],
             }).eq("address", wallet).execute()
     except Exception as e:
         logger.warning(f"Score save failed: {e}")
 
-    # Emoji for classification
     emoji = {
         "smart_money": "🎯",
         "insider": "🔒",
@@ -1764,11 +1394,12 @@ async def score_command(update, context):
         f"{emoji} <b>{scored['classification'].upper()}</b>\n"
         f"<code>{wallet}</code>\n\n"
         f"<b>14-day history:</b>\n"
-        f"  Trades: {history['trade_count']}\n"
+        f"  Total swaps: {history['trade_count']}\n"
         f"  Unique coins: {history['unique_coins']}\n"
-        f"  Winners (2x+): {history['winners']}\n"
-        f"  Losers (-50%): {history['losers']}\n"
-        f"  Net P&L: {history['net_sol_pnl']:+.2f} SOL\n"
+        f"  Realized P&L: {history['net_sol_pnl']:+.2f} SOL\n"
+        f"  Closed winners (≥2x): {history['winners']}\n"
+        f"  Closed losers (≤0.5x): {history['losers']}\n"
+        f"  Open/partial positions: {history.get('open_positions', 0)}\n"
         f"  First trade: {history['first_trade_days_ago']}d ago\n\n"
         f"<b>Scores:</b>\n"
         f"  Smart money: {scored['smart_money_score']}/100\n"
