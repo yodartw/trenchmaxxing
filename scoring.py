@@ -106,7 +106,9 @@ async def fetch_wallet_history(wallet_address, days=14):
                 coins[mint]["sells_sol"] += sol_delta
 
     winners = 0
+    big_winners = 0
     losers = 0
+    big_losers = 0
     open_positions = 0
     total_buy = 0
     total_sell = 0
@@ -122,8 +124,15 @@ async def fetch_wallet_history(wallet_address, days=14):
             open_positions += 1
         elif ratio >= 2.0:
             winners += 1
+            big_winners += 1
+        elif ratio >= 1.1:
+            winners += 1  # Modest winner
         elif ratio < 0.5:
             losers += 1
+            big_losers += 1
+        elif ratio < 0.9:
+            losers += 1  # Modest loser
+        # 0.9 to 1.1 = flat, not counted
 
     first_trade_days_ago = 0
     if earliest_ts:
@@ -134,7 +143,9 @@ async def fetch_wallet_history(wallet_address, days=14):
         "unique_coins": len(coins),
         "net_sol_pnl": round(total_sell - total_buy, 3),
         "winners": winners,
+        "big_winners": big_winners,
         "losers": losers,
+        "big_losers": big_losers,
         "open_positions": open_positions,
         "first_trade_days_ago": first_trade_days_ago,
     }
@@ -146,7 +157,9 @@ def _empty_history():
         "unique_coins": 0,
         "net_sol_pnl": 0.0,
         "winners": 0,
+        "big_winners": 0,
         "losers": 0,
+        "big_losers": 0,
         "open_positions": 0,
         "first_trade_days_ago": 0,
     }
