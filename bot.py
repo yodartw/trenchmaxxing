@@ -1472,8 +1472,13 @@ async def score_command(update, context):
         "dormant": "💤",
     }.get(scored["classification"], "❓")
 
+    tier_display = f" [{scored.get('tier')}]" if scored.get("tier") else ""
+    bot_flags = ""
+    if scored.get("bot_reasons"):
+        bot_flags = f"\n⚠️ Bot flags: {', '.join(scored['bot_reasons'])}"
+
     msg = (
-        f"{emoji} <b>{scored['classification'].upper()}</b>\n"
+        f"{emoji} <b>{scored['classification'].upper()}{tier_display}</b>{bot_flags}\n"
         f"<code>{wallet}</code>\n\n"
         f"<b>14-day history:</b>\n"
         f"  Total swaps: {history['trade_count']}\n"

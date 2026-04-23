@@ -153,86 +153,114 @@ def _empty_history():
 
 
 def classify_wallet(history):
-    """Score + classify based on 14d history. v3 — profit-aware noise filter."""
+    """Score + classify. v4 — tiered, profit-gated, bot-flagging."""
     trade_count = history["trade_count"]
     unique_coins = history["unique_coins"]
     winners = history["winners"]
     losers = history["losers"]
     net_pnl = history["net_sol_pnl"]
+    open_positions = history.get("open_positions", 0)
+
+    win_rate = winners / unique_coins if unique_coins > 0 else 0
 
     smart_money_score = 0
     insider_score = 0
     noise_score = 0
 
-    # Activity tier — expanded for pro scalpers
+    # ---- Layer 1: Hard bot filters ----
+    is_bot = False
+    bot_reasons = []
+
+    if trade_count > 500:
+        is_bot = True
+        bot_reasons.append("extreme_volume")
+    if trade_count > 100 and win_rate < 0.05:
+        is_bot = True
+        bot_reasons.append("spray_low_winrate")
+    if unique_coins > 50 and win_rate < 0.15:
+        is_bot = True
+        bot_reasons.append("shotgun_pattern")
+    if trade_count == 0:
+        # dormant, not bot
+        pass
+
+    # ---- Layer 2: Compute scores ----
+
+    # Activity
     if 5 <= trade_count <= 50:
         smart_money_score += 40
     elif 51 <= trade_count <= 150:
         smart_money_score += 30
-    elif 151 <= trade_count <= 400:
-        # High-volume territory — depends on profitability
-        if net_pnl > 20:
-            smart_money_score += 35  # Pro scalper
-        elif net_pnl > 0:
-            smart_money_score += 15
-        else:
-            noise_score += 50
-    elif trade_count > 400:
-        # Extreme volume — bot territory regardless
-        noise_score += 60
-    elif trade_count < 2:
-        noise_score += 40
+    elif 151 <= trade_count <= 300 and net_pnl > 20:
+        smart_money_score += 25  # high-volume but profitable
 
-    # Focused scalper signal
+    # Focused scalper
     if 3 <= unique_coins <= 15 and trade_count >= 10:
-        smart_money_score += 30
+        smart_money_score += 20
 
-    # Win rate
-    win_rate = winners / unique_coins if unique_coins > 0 else 0
-    if unique_coins >= 3:
-        if win_rate >= 0.3:
-            smart_money_score += 20
-        if win_rate >= 0.5:
-            smart_money_score += 10
+    # Win rate (30% floor for smart money)
+    if win_rate >= 0.3:
+        smart_money_score += 25
+    if win_rate >= 0.4:
+        smart_money_score += 15
+    if win_rate >= 0.5:
+        smart_money_score += 10
 
-    # P&L is king
+    # P&L
     if net_pnl > 50:
         smart_money_score += 35
     elif net_pnl > 20:
         smart_money_score += 25
+    elif net_pnl > 10:
+        smart_money_score += 18
     elif net_pnl > 5:
-        smart_money_score += 15
+        smart_money_score += 12
     elif net_pnl > 2:
-        smart_money_score += 10
+        smart_money_score += 8
     elif net_pnl < -10:
         smart_money_score -= 20
         noise_score += 15
 
-    # Shotgun loser pattern
-    if unique_coins > 10 and win_rate < 0.1 and net_pnl < 0:
-        noise_score += 30
-
-    # Insider pattern: surgical, small, profitable
+    # Insider pattern
     if unique_coins <= 4 and winners >= 2 and trade_count < 15:
         insider_score += 50
 
-    # Classification flow
+    # ---- Layer 3: Classification flow ----
     if trade_count == 0:
         classification = "dormant"
-    elif trade_count > 400:
+        tier = None
+    elif is_bot:
         classification = "noise"
-    elif noise_score > 50:
-        classification = "noise"
+        tier = None
     elif insider_score >= 50:
         classification = "insider"
-    elif smart_money_score >= 60 and noise_score < 30:
+        tier = None
+    elif net_pnl > 30 and trade_count > 150:
+        # Volume scalper: profitable but too active to copy-trade
+        classification = "volume_scalper"
+        tier = None
+    elif win_rate >= 0.4 and net_pnl > 10 and 10 <= trade_count <= 100:
         classification = "smart_money"
-    else:
+        tier = "A"
+    elif win_rate >= 0.3 and net_pnl > 5 and 5 <= trade_count <= 150:
+        classification = "smart_money"
+        tier = "B"
+    elif win_rate >= 0.3 and net_pnl > 2 and 5 <= trade_count <= 200:
+        classification = "smart_money"
+        tier = "C"
+    elif trade_count < 5:
         classification = "dormant"
+        tier = None
+    else:
+        # Active but doesn't meet smart_money criteria
+        classification = "dormant"
+        tier = None
 
     return {
         "smart_money_score": max(0, min(100, smart_money_score)),
         "insider_score": max(0, min(100, insider_score)),
         "noise_score": max(0, min(100, noise_score)),
         "classification": classification,
+        "tier": tier,
+        "bot_reasons": bot_reasons,
     }

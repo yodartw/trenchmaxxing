@@ -131,6 +131,7 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
             winners = history["winners"]
             classification = scored["classification"]
             sm_score = scored["smart_money_score"]
+            tier = scored.get("tier")
         elif existing_rec:
             pnl = None
             trades = None
@@ -138,6 +139,7 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
             winners = None
             classification = existing_rec.get("classification") or "unscored"
             sm_score = existing_rec.get("smart_money_score") or 0
+            tier = existing_rec.get("tier")
         else:
             # Neither scored nor in DB (exceeded scan limit)
             pnl = None
@@ -146,6 +148,7 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
             winners = None
             classification = "unscored"
             sm_score = 0
+            tier = None
 
         entries.append({
             "addr": addr,
@@ -157,6 +160,7 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
             "winners": winners,
             "classification": classification,
             "sm_score": sm_score,
+            "tier": tier,
             "existing": existing_rec,
             "bundle_id": wallet_to_bundle.get(addr),
         })
@@ -184,16 +188,17 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
     # Sort by research score desc
     entries.sort(key=lambda e: e["research_score"], reverse=True)
 
-    # Hard filter: must have real history AND positive P&L
+    # Hard filter: only smart_money (tiered) and insider classifications
     qualifying = [
         e for e in entries
-        if e["trades"] is not None
-        and e["trades"] >= 5
-        and e["unique_coins"] is not None
-        and e["unique_coins"] >= 3
-        and e["pnl"] is not None
-        and e["pnl"] > 0
+        if e["classification"] in ("smart_money", "insider")
     ]
+
+    # Track filtered counts by category
+    category_counts = {"smart_money": 0, "insider": 0, "volume_scalper": 0, "noise": 0, "dormant": 0, "unscored": 0}
+    for e in entries:
+        cls = e.get("classification") or "unscored"
+        category_counts[cls] = category_counts.get(cls, 0) + 1
 
     # Build output
     lines = [
@@ -208,12 +213,9 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
     if not qualifying:
         lines.append("<b>⚠️ No qualifying buyers found.</b>")
         lines.append("")
-        lines.append("None of the early buyers had:")
-        lines.append("  • 5+ trades in last 14d")
-        lines.append("  • 3+ unique coins traded")
-        lines.append("  • Positive P&L")
+        lines.append("No early buyers classified as <b>smart_money</b> or <b>insider</b>.")
         lines.append("")
-        lines.append("This coin may be pre-viral or not cabal-driven.")
+        lines.append("This coin may be pre-viral, bot-driven, or not cabal-driven.")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
         return
 
@@ -233,9 +235,13 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
             handle_str = handle.get("x_handle", "") if handle else ""
             tags.append(f"⚡ {cabal}{' ' + handle_str if handle_str else ''}")
         elif e["classification"] == "smart_money":
-            tags.append(f"🎯 sm:{e['sm_score']}")
+            tier = e.get("tier")
+            tier_str = f" [{tier}]" if tier else ""
+            tags.append(f"🎯 smart_money{tier_str} · sm:{e['sm_score']}")
         elif e["classification"] == "insider":
             tags.append(f"🔒 insider")
+        elif e["classification"] == "volume_scalper":
+            tags.append(f"⚡ volume_scalper")
         elif e["classification"] == "noise":
             tags.append(f"🤖 noise")
         elif e["classification"] == "dormant":
@@ -272,10 +278,17 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
 
         lines.append("")
 
-    filtered_out = len(entries) - len(qualifying)
-    if filtered_out > 0:
-        lines.append(f"<i>{filtered_out} buyers filtered (dormant / no activity / negative P&L)</i>")
-        lines.append("")
+    lines.append("")
+    lines.append(f"<b>Filtered:</b>")
+    if category_counts.get("volume_scalper", 0) > 0:
+        lines.append(f"  ⚡ {category_counts['volume_scalper']} volume_scalpers (profitable but too active)")
+    if category_counts.get("noise", 0) > 0:
+        lines.append(f"  🤖 {category_counts['noise']} noise (bots / losing high-vol)")
+    if category_counts.get("dormant", 0) > 0:
+        lines.append(f"  💤 {category_counts['dormant']} dormant / low activity")
+    if category_counts.get("unscored", 0) > 0:
+        lines.append(f"  ❓ {category_counts['unscored']} unscored (over scan limit)")
+    lines.append("")
 
     lines.append(f"<b>To save a wallet:</b> /promote <code>&lt;address&gt;</code>")
 
