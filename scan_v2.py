@@ -184,6 +184,17 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
     # Sort by research score desc
     entries.sort(key=lambda e: e["research_score"], reverse=True)
 
+    # Hard filter: must have real history AND positive P&L
+    qualifying = [
+        e for e in entries
+        if e["trades"] is not None
+        and e["trades"] >= 5
+        and e["unique_coins"] is not None
+        and e["unique_coins"] >= 3
+        and e["pnl"] is not None
+        and e["pnl"] > 0
+    ]
+
     # Build output
     lines = [
         f"🔍 <b>/scan ${token_symbol}</b>",
@@ -194,11 +205,23 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
     ]
 
     # Show top 20 entries
+    if not qualifying:
+        lines.append("<b>⚠️ No qualifying buyers found.</b>")
+        lines.append("")
+        lines.append("None of the early buyers had:")
+        lines.append("  • 5+ trades in last 14d")
+        lines.append("  • 3+ unique coins traded")
+        lines.append("  • Positive P&L")
+        lines.append("")
+        lines.append("This coin may be pre-viral or not cabal-driven.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+        return
+
     lines.append(f"<b>Ranked by research score (entry 70% + 14d P&L 30%)</b>")
     lines.append("")
 
-    display_count = min(20, len(entries))
-    for i, e in enumerate(entries[:display_count]):
+    display_count = min(20, len(qualifying))
+    for i, e in enumerate(qualifying[:display_count]):
         addr_short = e["addr"][:8]
         entry_min = (e["buyer_info"]["block_time"] - ordered_buyers[0][1]["block_time"]) / 60
 
@@ -240,8 +263,9 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
             )
         lines.append("")
 
-    if len(entries) > display_count:
-        lines.append(f"<i>...+{len(entries) - display_count} more buyers not shown</i>")
+    filtered_out = len(entries) - len(qualifying)
+    if filtered_out > 0:
+        lines.append(f"<i>{filtered_out} buyers filtered (dormant / no activity / negative P&L)</i>")
         lines.append("")
 
     lines.append(f"<b>To save a wallet:</b> /promote <code>&lt;address&gt;</code>")

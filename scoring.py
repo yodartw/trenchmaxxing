@@ -27,7 +27,7 @@ async def fetch_wallet_history(wallet_address, days=14):
     cutoff = int(time.time()) - (days * 86400)
 
     url = f"{HELIUS_BASE}/addresses/{wallet_address}/transactions"
-    params_base = {"api-key": HELIUS_API_KEY, "limit": 100, "type": "SWAP"}
+    params_base = {"api-key": HELIUS_API_KEY, "limit": 100}
 
     all_txs = []
     before = None
@@ -62,12 +62,25 @@ async def fetch_wallet_history(wallet_address, days=14):
         ts = tx.get("timestamp", 0)
         if ts < cutoff:
             continue
-        in_window_count += 1
-        if earliest_ts is None or ts < earliest_ts:
-            earliest_ts = ts
 
         token_transfers = tx.get("tokenTransfers") or []
         account_data = tx.get("accountData") or []
+
+        # Only count tx if it involves a non-stable token transfer for this wallet
+        is_swap_like = False
+        for tt in token_transfers:
+            mint = tt.get("mint")
+            if mint in SKIP_MINTS:
+                continue
+            if tt.get("toUserAccount") == wallet_address or tt.get("fromUserAccount") == wallet_address:
+                is_swap_like = True
+                break
+        if not is_swap_like:
+            continue
+
+        in_window_count += 1
+        if earliest_ts is None or ts < earliest_ts:
+            earliest_ts = ts
 
         sol_delta = 0
         for ad in account_data:
