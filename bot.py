@@ -1259,6 +1259,197 @@ async def confluence_command(update, context):
     await update.message.reply_text(
         "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
     )
+
+
+# ---------- /scan — early buyer discovery ----------
+
+async def fetch_early_buyers(mint_address, window_seconds=300, max_pages=5):
+    url = f"{HELIUS_BASE}/addresses/{mint_address}/transactions"
+    params_base = {"api-key": HELIUS_API_KEY, "limit": 100}
+
+    all_txs = []
+    before = None
+    for _ in range(max_pages):
+        params = dict(params_base)
+        if before:
+            params["before"] = before
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                chunk = r.json()
+        except Exception as e:
+            logger.warning(f"Pagination failed: {e}")
+            break
+        if not chunk:
+            break
+        all_txs.extend(chunk)
+        before = chunk[-1].get("signature")
+        if len(chunk) < 100:
+            break
+
+    if not all_txs:
+        return []
+
+    timestamps = [t.get("timestamp") for t in all_txs if t.get("timestamp")]
+    if not timestamps:
+        return []
+    earliest = min(timestamps)
+    window_end = earliest + window_seconds
+    in_window = [t for t in all_txs if t.get("timestamp") and earliest <= t["timestamp"] <= window_end]
+
+    buyers = []
+    for tx in in_window:
+        try:
+            token_transfers = tx.get("tokenTransfers") or []
+            account_data = tx.get("accountData") or []
+            sig = tx.get("signature")
+            timestamp = tx.get("timestamp")
+
+            for tt in token_transfers:
+                if tt.get("mint") != mint_address:
+                    continue
+                to_user = tt.get("toUserAccount")
+                from_user = tt.get("fromUserAccount")
+                if not to_user or to_user == from_user:
+                    continue
+
+                sol_delta = 0
+                for ad in account_data:
+                    if ad.get("account") == to_user:
+                        sol_delta = int(ad.get("nativeBalanceChange", 0))
+                        break
+                sol_spent = abs(sol_delta) / 1e9 if sol_delta < 0 else 0
+                if sol_spent <= 0:
+                    continue
+
+                buyers.append({
+                    "buyer": to_user,
+                    "tx_signature": sig,
+                    "block_time": timestamp,
+                    "sol_in": sol_spent,
+                })
+        except Exception as e:
+            logger.warning(f"Parse buyer failed: {e}")
+            continue
+    return buyers
+
+
+def detect_bundles(buyers):
+    by_tx = {}
+    for b in buyers:
+        by_tx.setdefault(b["tx_signature"], []).append(b["buyer"])
+    return {sig: addrs for sig, addrs in by_tx.items() if len(addrs) > 1}
+
+
+async def scan_command(update, context):
+    if not context.args:
+        await update.message.reply_text("Usage: /scan <mint_address>")
+        return
+
+    mint = context.args[0].strip()
+    if len(mint) < 30 or len(mint) > 50:
+        await update.message.reply_text("That doesn't look like a Solana mint address.")
+        return
+
+    await update.message.reply_text(f"Scanning {mint[:10]}... first 5min of buyers...")
+
+    buyers = await fetch_early_buyers(mint, window_seconds=300)
+    if not buyers:
+        await update.message.reply_text("No early buyers found or API error.")
+        return
+
+    bundles = detect_bundles(buyers)
+
+    unique_buyers = {}
+    for b in buyers:
+        w = b["buyer"]
+        if w not in unique_buyers or b["block_time"] < unique_buyers[w]["block_time"]:
+            unique_buyers[w] = b
+
+    wallet_to_bundle = {}
+    for tx_sig, wallets in bundles.items():
+        group_id = f"bundle:{mint[:8]}:{tx_sig[:8]}"
+        for w in wallets:
+            wallet_to_bundle[w] = group_id
+
+    addresses = list(unique_buyers.keys())
+    existing = (
+        supabase.table("wallets")
+        .select("address, quality_tier, cabals(name), cabal_members(x_handle)")
+        .in_("address", addresses)
+        .execute()
+    ).data or []
+    existing_map = {w["address"]: w for w in existing}
+
+    sym_result = supabase.table("tokens").select("symbol").eq("address", mint).eq("chain", "sol").execute()
+    token_symbol = sym_result.data[0]["symbol"] if sym_result.data else mint[:6]
+
+    added_count = 0
+    for addr, buyer_info in unique_buyers.items():
+        if addr in existing_map:
+            continue
+        bundle_group = wallet_to_bundle.get(addr)
+        label = f"scan:{token_symbol} first-{buyer_info['sol_in']:.1f}SOL"
+        if bundle_group:
+            label = f"{bundle_group} {label}"
+        try:
+            supabase.table("wallets").insert({
+                "chain": "sol",
+                "address": addr,
+                "wallet_type": "unknown",
+                "confidence": "suspected",
+                "label": label,
+                "discovered_via": f"scan:{token_symbol}",
+                "quality_tier": "raw",
+                "bundle_group_id": bundle_group,
+            }).execute()
+            added_count += 1
+        except Exception as e:
+            if "duplicate" not in str(e).lower():
+                logger.warning(f"Scan insert failed {addr}: {e}")
+
+    lines = [
+        f"🔍 <b>/scan ${token_symbol}</b>",
+        f"<code>{mint}</code>",
+        f"{len(unique_buyers)} unique buyers · {len(bundles)} bundle groups",
+        "",
+    ]
+
+    attributed = [(a, info) for a, info in unique_buyers.items()
+                  if a in existing_map and existing_map[a].get("cabals")]
+    unknown_hits = [(a, info) for a, info in unique_buyers.items()
+                    if a in existing_map and not existing_map[a].get("cabals")]
+    new_raw = [(a, info) for a, info in unique_buyers.items() if a not in existing_map]
+
+    if attributed:
+        lines.append(f"<b>⚡ Attributed ({len(attributed)}):</b>")
+        for addr, info in sorted(attributed, key=lambda x: x[1]["block_time"])[:15]:
+            w = existing_map[addr]
+            cabal = w["cabals"]["name"] if w.get("cabals") else "?"
+            handle = w["cabal_members"]["x_handle"] if w.get("cabal_members") else ""
+            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
+            lines.append(f"  {cabal} {handle}{bundle_str} · {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>")
+        lines.append("")
+
+    if unknown_hits:
+        lines.append(f"<b>📊 Known-unknown ({len(unknown_hits)}):</b>")
+        for addr, info in sorted(unknown_hits, key=lambda x: x[1]["block_time"])[:10]:
+            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
+            lines.append(f"  {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>{bundle_str}")
+        lines.append("")
+
+    if new_raw:
+        lines.append(f"<b>🆕 New as raw ({added_count}):</b>")
+        for addr, info in sorted(new_raw, key=lambda x: x[1]["block_time"])[:15]:
+            bundle_str = " 🔗" if wallet_to_bundle.get(addr) else ""
+            lines.append(f"  {info['sol_in']:.2f} SOL · <code>{addr[:8]}...</code>{bundle_str}")
+        if len(new_raw) > 15:
+            lines.append(f"  <i>...+{len(new_raw) - 15} more (all added)</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
@@ -1278,6 +1469,7 @@ def main():
     app.add_handler(CommandHandler("activity", activity_command))
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("confluence", confluence_command))
+    app.add_handler(CommandHandler("scan", scan_command))
     logger.info("Bot starting polling...")
     app.run_polling()
 
