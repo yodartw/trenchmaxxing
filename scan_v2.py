@@ -1,6 +1,6 @@
 """
 Enhanced /scan command — research view for historical winners.
-- Fetches first 30min of buyers
+- Fetches first 60min of buyers
 - Scores each buyer's 14-day general history
 - Ranks by combination of entry earliness (70%) + 14d P&L (30%)
 - NO auto-save to DB — use /promote to curate
@@ -13,7 +13,7 @@ from scoring import fetch_wallet_history, classify_wallet
 logger = logging.getLogger(__name__)
 
 SCORE_LIMIT_PER_SCAN = 50
-WINDOW_SECONDS = 1800  # 30 minutes
+WINDOW_SECONDS = 3600  # 60 minutes
 
 
 def compute_research_score(wallet_idx, total_wallets, pnl_rank, total_scored):
@@ -63,7 +63,7 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
         return
 
     await update.message.reply_text(
-        f"Scanning {mint[:10]}... first 30min of buyers, scoring up to {SCORE_LIMIT_PER_SCAN}..."
+        f"Scanning {mint[:10]}... first 60min of buyers, scoring up to {SCORE_LIMIT_PER_SCAN}..."
     )
 
     buyers = await fetch_early_buyers(mint, window_seconds=WINDOW_SECONDS)
@@ -200,11 +200,46 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
         cls = e.get("classification") or "unscored"
         category_counts[cls] = category_counts.get(cls, 0) + 1
 
+    # Debug: hit rate distribution
+    debug_stats = {
+        "wallets_with_activity": 0,
+        "wallets_30plus_hit": 0,
+        "wallets_20_30_hit": 0,
+        "wallets_10_20_hit": 0,
+        "wallets_under_10_hit": 0,
+        "wallets_profitable": 0,
+        "wallets_losing": 0,
+        "highest_hit_rate": 0,
+        "highest_pnl": 0,
+    }
+    for e in entries:
+        if e["trades"] and e["trades"] >= 5 and e["unique_coins"] and e["unique_coins"] >= 3:
+            debug_stats["wallets_with_activity"] += 1
+            hit_rate = (e["winners"] / e["unique_coins"]) if e["unique_coins"] else 0
+            if hit_rate >= 0.3:
+                debug_stats["wallets_30plus_hit"] += 1
+            elif hit_rate >= 0.2:
+                debug_stats["wallets_20_30_hit"] += 1
+            elif hit_rate >= 0.1:
+                debug_stats["wallets_10_20_hit"] += 1
+            else:
+                debug_stats["wallets_under_10_hit"] += 1
+
+            if e["pnl"] and e["pnl"] > 0:
+                debug_stats["wallets_profitable"] += 1
+            elif e["pnl"] and e["pnl"] < 0:
+                debug_stats["wallets_losing"] += 1
+
+            if hit_rate > debug_stats["highest_hit_rate"]:
+                debug_stats["highest_hit_rate"] = hit_rate
+            if e["pnl"] and e["pnl"] > debug_stats["highest_pnl"]:
+                debug_stats["highest_pnl"] = e["pnl"]
+
     # Build output
     lines = [
         f"🔍 <b>/scan ${token_symbol}</b>",
         f"<code>{mint}</code>",
-        f"{len(unique_buyers)} buyers · 30min window · {len(bundles)} bundle groups",
+        f"{len(unique_buyers)} buyers · 60min window · {len(bundles)} bundle groups",
         f"Scored {len(scored_new)} new · {len(existing_map)} already in DB",
         "",
     ]
@@ -288,6 +323,18 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
         lines.append(f"  💤 {category_counts['dormant']} dormant / low activity")
     if category_counts.get("unscored", 0) > 0:
         lines.append(f"  ❓ {category_counts['unscored']} unscored (over scan limit)")
+    lines.append("")
+
+    # Debug output — helps diagnose if filters are too tight or data is bad
+    lines.append(f"<b>🔬 Debug (hit rate distribution):</b>")
+    lines.append(f"  Wallets with 5+ trades: {debug_stats['wallets_with_activity']}")
+    lines.append(f"  30%+ hit rate: {debug_stats['wallets_30plus_hit']}")
+    lines.append(f"  20-30% hit rate: {debug_stats['wallets_20_30_hit']}")
+    lines.append(f"  10-20% hit rate: {debug_stats['wallets_10_20_hit']}")
+    lines.append(f"  &lt;10% hit rate: {debug_stats['wallets_under_10_hit']}")
+    lines.append(f"  Profitable: {debug_stats['wallets_profitable']} · Losing: {debug_stats['wallets_losing']}")
+    lines.append(f"  Max hit rate: {debug_stats['highest_hit_rate']*100:.0f}%")
+    lines.append(f"  Max P&L: +{debug_stats['highest_pnl']:.1f} SOL")
     lines.append("")
 
     lines.append(f"<b>To save a wallet:</b> /promote <code>&lt;address&gt;</code>")
