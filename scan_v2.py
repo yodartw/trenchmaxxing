@@ -244,13 +244,29 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
         "",
     ]
 
+    # Always show debug stats, even when nothing qualifies
+    lines.append(f"<b>🔬 Debug (hit rate distribution):</b>")
+    lines.append(f"  Wallets with 5+ trades: {debug_stats['wallets_with_activity']}")
+    lines.append(f"  30%+ hit rate: {debug_stats['wallets_30plus_hit']}")
+    lines.append(f"  20-30% hit rate: {debug_stats['wallets_20_30_hit']}")
+    lines.append(f"  10-20% hit rate: {debug_stats['wallets_10_20_hit']}")
+    lines.append(f"  &lt;10% hit rate: {debug_stats['wallets_under_10_hit']}")
+    lines.append(f"  Profitable: {debug_stats['wallets_profitable']} · Losing: {debug_stats['wallets_losing']}")
+    lines.append(f"  Max hit rate: {debug_stats['highest_hit_rate']*100:.0f}%")
+    lines.append(f"  Max P&L: +{debug_stats['highest_pnl']:.1f} SOL")
+    lines.append("")
+
     # Show top 20 entries
     if not qualifying:
         lines.append("<b>⚠️ No qualifying buyers found.</b>")
         lines.append("")
-        lines.append("No early buyers classified as <b>smart_money</b> or <b>insider</b>.")
+        lines.append("None of the early buyers had:")
+        lines.append("  • 5+ trades in last 14d")
+        lines.append("  • 3+ unique coins traded")
+        lines.append("  • Positive P&L")
+        lines.append("  • 20%+ hit rate")
         lines.append("")
-        lines.append("This coin may be pre-viral, bot-driven, or not cabal-driven.")
+        lines.append("This coin may be pre-viral or not cabal-driven.")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
         return
 
@@ -323,18 +339,6 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
         lines.append(f"  💤 {category_counts['dormant']} dormant / low activity")
     if category_counts.get("unscored", 0) > 0:
         lines.append(f"  ❓ {category_counts['unscored']} unscored (over scan limit)")
-    lines.append("")
-
-    # Debug output — helps diagnose if filters are too tight or data is bad
-    lines.append(f"<b>🔬 Debug (hit rate distribution):</b>")
-    lines.append(f"  Wallets with 5+ trades: {debug_stats['wallets_with_activity']}")
-    lines.append(f"  30%+ hit rate: {debug_stats['wallets_30plus_hit']}")
-    lines.append(f"  20-30% hit rate: {debug_stats['wallets_20_30_hit']}")
-    lines.append(f"  10-20% hit rate: {debug_stats['wallets_10_20_hit']}")
-    lines.append(f"  &lt;10% hit rate: {debug_stats['wallets_under_10_hit']}")
-    lines.append(f"  Profitable: {debug_stats['wallets_profitable']} · Losing: {debug_stats['wallets_losing']}")
-    lines.append(f"  Max hit rate: {debug_stats['highest_hit_rate']*100:.0f}%")
-    lines.append(f"  Max P&L: +{debug_stats['highest_pnl']:.1f} SOL")
     lines.append("")
 
     lines.append(f"<b>To save a wallet:</b> /promote <code>&lt;address&gt;</code>")

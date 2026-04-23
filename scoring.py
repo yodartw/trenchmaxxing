@@ -245,7 +245,7 @@ def classify_wallet(history):
     elif win_rate >= 0.3 and net_pnl > 5 and 5 <= trade_count <= 150:
         classification = "smart_money"
         tier = "B"
-    elif win_rate >= 0.3 and net_pnl > 2 and 5 <= trade_count <= 200:
+    elif win_rate >= 0.2 and net_pnl > 2 and 5 <= trade_count <= 200:
         classification = "smart_money"
         tier = "C"
     elif trade_count < 5:
