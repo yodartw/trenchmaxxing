@@ -222,7 +222,7 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
 
     display_count = min(20, len(qualifying))
     for i, e in enumerate(qualifying[:display_count]):
-        addr_short = e["addr"][:8]
+        addr = e["addr"]
         entry_min = (e["buyer_info"]["block_time"] - ordered_buyers[0][1]["block_time"]) / 60
 
         # Tags
@@ -245,22 +245,31 @@ async def scan_command_v2(update, context, supabase, fetch_early_buyers, detect_
 
         if e["bundle_id"]:
             tags.append("🔗")
-
         tag_str = " · ".join(tags)
 
-        # Core line
         sol_in = e["buyer_info"]["sol_in"]
-        lines.append(
-            f"<b>#{i+1} · {e['research_score']}</b> · <code>{addr_short}...</code> · {tag_str}"
-        )
+
+        # Header line: rank + score + tag
+        lines.append(f"<b>#{i+1} · {e['research_score']}</b> · {tag_str}")
+
+        # Entry
         lines.append(f"    Entry: {sol_in:.2f} SOL @ {entry_min:.1f}min")
 
-        # Stats line (only if scored)
+        # Stats
         if e["pnl"] is not None:
             hit_rate = (e["winners"] / e["unique_coins"] * 100) if e["unique_coins"] else 0
             lines.append(
                 f"    14d: {e['pnl']:+.1f} SOL · {e['trades']}t · {e['unique_coins']}c · {hit_rate:.0f}% hit"
             )
+
+        # Full copyable address
+        lines.append(f"    <code>{addr}</code>")
+
+        # Solscan + Axiom links
+        solscan = f"https://solscan.io/account/{addr}"
+        axiom = f"https://axiom.trade/@{addr}"
+        lines.append(f'    <a href="{solscan}">solscan</a> · <a href="{axiom}">axiom</a>')
+
         lines.append("")
 
     filtered_out = len(entries) - len(qualifying)

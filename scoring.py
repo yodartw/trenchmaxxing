@@ -153,7 +153,7 @@ def _empty_history():
 
 
 def classify_wallet(history):
-    """Score + classify based on 14d history. v2."""
+    """Score + classify based on 14d history. v3 — profit-aware noise filter."""
     trade_count = history["trade_count"]
     unique_coins = history["unique_coins"]
     winners = history["winners"]
@@ -164,12 +164,21 @@ def classify_wallet(history):
     insider_score = 0
     noise_score = 0
 
-    # Activity tier
+    # Activity tier — expanded for pro scalpers
     if 5 <= trade_count <= 50:
         smart_money_score += 40
     elif 51 <= trade_count <= 150:
-        smart_money_score += 25
-    elif trade_count > 200:
+        smart_money_score += 30
+    elif 151 <= trade_count <= 400:
+        # High-volume territory — depends on profitability
+        if net_pnl > 20:
+            smart_money_score += 35  # Pro scalper
+        elif net_pnl > 0:
+            smart_money_score += 15
+        else:
+            noise_score += 50
+    elif trade_count > 400:
+        # Extreme volume — bot territory regardless
         noise_score += 60
     elif trade_count < 2:
         noise_score += 40
@@ -178,7 +187,7 @@ def classify_wallet(history):
     if 3 <= unique_coins <= 15 and trade_count >= 10:
         smart_money_score += 30
 
-    # Win rate (requires at least some coin sample)
+    # Win rate
     win_rate = winners / unique_coins if unique_coins > 0 else 0
     if unique_coins >= 3:
         if win_rate >= 0.3:
@@ -187,15 +196,20 @@ def classify_wallet(history):
             smart_money_score += 10
 
     # P&L is king
-    if net_pnl > 5:
+    if net_pnl > 50:
+        smart_money_score += 35
+    elif net_pnl > 20:
         smart_money_score += 25
-    elif net_pnl > 2:
+    elif net_pnl > 5:
         smart_money_score += 15
+    elif net_pnl > 2:
+        smart_money_score += 10
     elif net_pnl < -10:
         smart_money_score -= 20
+        noise_score += 15
 
     # Shotgun loser pattern
-    if unique_coins > 10 and win_rate < 0.1:
+    if unique_coins > 10 and win_rate < 0.1 and net_pnl < 0:
         noise_score += 30
 
     # Insider pattern: surgical, small, profitable
@@ -205,7 +219,9 @@ def classify_wallet(history):
     # Classification flow
     if trade_count == 0:
         classification = "dormant"
-    elif noise_score > 50 or trade_count > 200:
+    elif trade_count > 400:
+        classification = "noise"
+    elif noise_score > 50:
         classification = "noise"
     elif insider_score >= 50:
         classification = "insider"
