@@ -166,7 +166,7 @@ def _empty_history():
 
 
 def classify_wallet(history):
-    """Score + classify. v4 — tiered, profit-gated, bot-flagging."""
+    """Score + classify. v5 — realistic bot detection, 20/25/30 hit rate floors."""
     trade_count = history["trade_count"]
     unique_coins = history["unique_coins"]
     winners = history["winners"]
@@ -180,43 +180,43 @@ def classify_wallet(history):
     insider_score = 0
     noise_score = 0
 
-    # ---- Layer 1: Hard bot filters ----
+    # ---- Bot detection: require MULTIPLE signals, not just volume ----
     is_bot = False
     bot_reasons = []
 
-    if trade_count > 500:
+    if trade_count > 1000:
         is_bot = True
         bot_reasons.append("extreme_volume")
-    if trade_count > 100 and win_rate < 0.05:
+    if trade_count > 500 and net_pnl < 0:
+        is_bot = True
+        bot_reasons.append("losing_high_volume")
+    if trade_count > 300 and win_rate < 0.1:
         is_bot = True
         bot_reasons.append("spray_low_winrate")
-    if unique_coins > 50 and win_rate < 0.15:
+    if unique_coins > 80 and win_rate < 0.15:
         is_bot = True
         bot_reasons.append("shotgun_pattern")
-    if trade_count == 0:
-        # dormant, not bot
-        pass
 
-    # ---- Layer 2: Compute scores ----
+    # ---- Smart money score components ----
 
-    # Activity
-    if 5 <= trade_count <= 50:
+    # Activity (expanded upper bound)
+    if 5 <= trade_count <= 100:
         smart_money_score += 40
-    elif 51 <= trade_count <= 150:
+    elif 101 <= trade_count <= 300:
         smart_money_score += 30
-    elif 151 <= trade_count <= 300 and net_pnl > 20:
-        smart_money_score += 25  # high-volume but profitable
+    elif 301 <= trade_count <= 600 and net_pnl > 10:
+        smart_money_score += 25
 
     # Focused scalper
-    if 3 <= unique_coins <= 15 and trade_count >= 10:
+    if 3 <= unique_coins <= 20 and trade_count >= 10:
         smart_money_score += 20
 
-    # Win rate (30% floor for smart money)
+    # Win rate (lower floors)
+    if win_rate >= 0.2:
+        smart_money_score += 20
     if win_rate >= 0.3:
-        smart_money_score += 25
-    if win_rate >= 0.4:
         smart_money_score += 15
-    if win_rate >= 0.5:
+    if win_rate >= 0.4:
         smart_money_score += 10
 
     # P&L
@@ -238,7 +238,7 @@ def classify_wallet(history):
     if unique_coins <= 4 and winners >= 2 and trade_count < 15:
         insider_score += 50
 
-    # ---- Layer 3: Classification flow ----
+    # ---- Classification flow ----
     if trade_count == 0:
         classification = "dormant"
         tier = None
@@ -248,24 +248,23 @@ def classify_wallet(history):
     elif insider_score >= 50:
         classification = "insider"
         tier = None
-    elif net_pnl > 30 and trade_count > 150:
-        # Volume scalper: profitable but too active to copy-trade
+    elif net_pnl > 50 and trade_count > 300:
+        # Volume scalper: profitable high-volume pro (not copy-tradeable but worth tracking)
         classification = "volume_scalper"
         tier = None
-    elif win_rate >= 0.4 and net_pnl > 10 and 10 <= trade_count <= 100:
+    elif win_rate >= 0.3 and net_pnl > 20 and 10 <= trade_count <= 200:
         classification = "smart_money"
         tier = "A"
-    elif win_rate >= 0.3 and net_pnl > 5 and 5 <= trade_count <= 150:
+    elif win_rate >= 0.25 and net_pnl > 10 and 5 <= trade_count <= 400:
         classification = "smart_money"
         tier = "B"
-    elif win_rate >= 0.2 and net_pnl > 2 and 5 <= trade_count <= 200:
+    elif win_rate >= 0.2 and net_pnl > 3 and 5 <= trade_count <= 600:
         classification = "smart_money"
         tier = "C"
     elif trade_count < 5:
         classification = "dormant"
         tier = None
     else:
-        # Active but doesn't meet smart_money criteria
         classification = "dormant"
         tier = None
 
