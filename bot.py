@@ -1477,15 +1477,21 @@ async def score_command(update, context):
     if scored.get("bot_reasons"):
         bot_flags = f"\n⚠️ Bot flags: {', '.join(scored['bot_reasons'])}"
 
+    # Compute hit rate from history
+    unique_coins = history["unique_coins"]
+    winners = history["winners"]
+    hit_rate = (winners / unique_coins * 100) if unique_coins > 0 else 0
+
     msg = (
         f"{emoji} <b>{scored['classification'].upper()}{tier_display}</b>{bot_flags}\n"
         f"<code>{wallet}</code>\n\n"
         f"<b>14-day history:</b>\n"
         f"  Total swaps: {history['trade_count']}\n"
-        f"  Unique coins: {history['unique_coins']}\n"
+        f"  Unique coins: {unique_coins}\n"
+        f"  <b>Hit rate: {hit_rate:.0f}%</b> ({winners}/{unique_coins})\n"
         f"  Realized P&L: {history['net_sol_pnl']:+.2f} SOL\n"
-        f"  Closed winners (≥2x): {history['winners']}\n"
-        f"  Closed losers (≤0.5x): {history['losers']}\n"
+        f"  Closed winners (≥1.1x): {winners}\n"
+        f"  Closed losers (≤0.9x): {history['losers']}\n"
         f"  Open/partial positions: {history.get('open_positions', 0)}\n"
         f"  First trade: {history['first_trade_days_ago']}d ago\n\n"
         f"<b>Scores:</b>\n"
