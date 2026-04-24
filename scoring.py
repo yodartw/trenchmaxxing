@@ -180,7 +180,7 @@ def classify_wallet(history):
     insider_score = 0
     noise_score = 0
 
-    # ---- Bot detection: require MULTIPLE signals, not just volume ----
+    # ---- Bot / too-fast detection ----
     is_bot = False
     bot_reasons = []
 
@@ -196,6 +196,10 @@ def classify_wallet(history):
     if unique_coins > 80 and win_rate < 0.15:
         is_bot = True
         bot_reasons.append("shotgun_pattern")
+    # Too fast and too diversified to follow (even if profitable)
+    if trade_count > 500 and unique_coins > 50:
+        is_bot = True
+        bot_reasons.append("too_fast_too_diversified")
 
     # ---- Smart money score components ----
 
@@ -247,10 +251,6 @@ def classify_wallet(history):
         tier = None
     elif insider_score >= 50:
         classification = "insider"
-        tier = None
-    elif net_pnl > 50 and trade_count > 300:
-        # Volume scalper: profitable high-volume pro (not copy-tradeable but worth tracking)
-        classification = "volume_scalper"
         tier = None
     elif win_rate >= 0.3 and net_pnl > 20 and 10 <= trade_count <= 200:
         classification = "smart_money"
